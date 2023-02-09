@@ -1,14 +1,14 @@
 NUM_SHARDS=1
-NUM_GPUS=8
-BATCH_SIZE=128
+NUM_GPUS=1
+BATCH_SIZE=16
 BASE_LR=4e-5
 PYTHONPATH=$PYTHONPATH:./slowfast \
 python tools/run_net_multi_node.py \
   --init_method tcp://localhost:10125 \
-  --cfg $work_path/config.yaml \
+  --cfg exp/sthv2/ssv2_b16_f16x224/config.yaml \
   --num_shards $NUM_SHARDS \
   DATA.PATH_TO_DATA_DIR ./data_list/sthv2 \
-  DATA.PATH_PREFIX you_data_path/sthv2 \
+  DATA.PATH_PREFIX ../SSV2/20bn-something-something-v2 \
   DATA.LABEL_PATH_TEMPLATE "somesomev2_rgb_{}_split.txt" \
   DATA.IMAGE_TEMPLATE "img_{:05d}.jpg" \
   TRAIN.EVAL_PERIOD 1 \
@@ -27,4 +27,4 @@ python tools/run_net_multi_node.py \
   TEST.TEST_BEST True \
   DATA.MC True \
   RNG_SEED 6666 \
-  OUTPUT_DIR $work_path
+  OUTPUT_DIR ./output
