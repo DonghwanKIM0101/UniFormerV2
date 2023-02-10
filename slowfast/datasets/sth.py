@@ -65,6 +65,7 @@ class Sth(torch.utils.data.Dataset):
         self.mode = mode
         self.cfg = cfg
 
+        self._video_meta = {}
         self._num_retries = num_retries
         # For training or validation mode, one single clip is sampled from every
         # video. For testing, NUM_ENSEMBLE_VIEWS clips are sampled from every
@@ -72,6 +73,7 @@ class Sth(torch.utils.data.Dataset):
         # the frames.
         if self.mode in ["train", "val"]:
             self._num_clips = 1
+            cfg.TEST.NUM_ENSEMBLE_VIEWS = 1
         elif self.mode in ["test"]:
             self._num_clips = cfg.TEST.NUM_ENSEMBLE_VIEWS * cfg.TEST.NUM_SPATIAL_CROPS
 
@@ -114,6 +116,10 @@ class Sth(torch.utils.data.Dataset):
             # 0: path, 1: num_frames
             self._path_to_videos.append([path, num_frames])
             self._labels.append(label)
+
+        self._video_meta = list(
+            chain.from_iterable([{} * self._num_clips for _ in self._path_to_videos])
+        )
 
         # Extend self when self._num_clips > 1 (during testing).
         self._path_to_videos = list(
