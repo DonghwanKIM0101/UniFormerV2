@@ -9,10 +9,13 @@ from itertools import chain as chain
 import torch
 from torchvision import transforms
 import torch.utils.data
+from iopath.common.file_io import g_pathmgr
 
 import slowfast.utils.logging as logging
 
+from . import decoder as decoder
 from . import utils as utils
+from . import video_container as container
 from .build import DATASET_REGISTRY
 from .random_erasing import RandomErasing
 from .transform import create_random_augment
@@ -38,6 +41,12 @@ class Sth(torch.utils.data.Dataset):
         Dataset object. The dataset could be downloaded from Something-Something
         official website (https://20bn.com/datasets/something-something).
         Please see datasets/DATASET.md for more information about the data format.
+        The format of the txt file is:
+        ```
+        video1_index video1_num_frames label_1
+        video2_index video2_num_frames label_2
+        video3_index video3_num_frames label_3
+        ```
         Args:
             cfg (CfgNode): configs.
             mode (string): Options includes `train`, `val`, or `test` mode.
@@ -64,9 +73,7 @@ class Sth(torch.utils.data.Dataset):
         if self.mode in ["train", "val"]:
             self._num_clips = 1
         elif self.mode in ["test"]:
-            self._num_clips = (
-                cfg.TEST.NUM_ENSEMBLE_VIEWS * cfg.TEST.NUM_SPATIAL_CROPS
-            )
+            self._num_clips = cfg.TEST.NUM_ENSEMBLE_VIEWS * cfg.TEST.NUM_SPATIAL_CROPS
 
         logger.info("Constructing Something-Something {}...".format(mode))
         self._construct_loader()
@@ -88,7 +95,9 @@ class Sth(torch.utils.data.Dataset):
                 "train" if self.mode == "train" else "validation"
             ),
         )
-        tmp = [x.strip().split(' ') for x in open(path_to_file)]
+        assert g_pathmgr.exists(path_to_file), "{} dir not found".format(path_to_file)
+
+        tmp = [x.strip().split(" ") for x in open(path_to_file)]
         self._path_to_videos = list()
         self._labels = list()
         for item in tmp:
@@ -108,26 +117,19 @@ class Sth(torch.utils.data.Dataset):
 
         # Extend self when self._num_clips > 1 (during testing).
         self._path_to_videos = list(
-            chain.from_iterable(
-                [[x] * self._num_clips for x in self._path_to_videos]
-            )
+            chain.from_iterable([[x] * self._num_clips for x in self._path_to_videos])
         )
         self._labels = list(
             chain.from_iterable([[x] * self._num_clips for x in self._labels])
         )
         self._spatial_temporal_idx = list(
             chain.from_iterable(
-                [
-                    range(self._num_clips)
-                    for _ in range(len(self._path_to_videos))
-                ]
+                [range(self._num_clips) for _ in range(len(self._path_to_videos))]
             )
         )
         logger.info(
             "Something-Something dataloader constructed "
-            " (size: {}) from {}".format(
-                len(self._path_to_videos), path_to_file
-            )
+            " (size: {}) from {}".format(len(self._path_to_videos), path_to_file)
         )
 
     def get_seq_frames(self, index, temporal_sample_index):
@@ -193,101 +195,153 @@ class Sth(torch.utils.data.Dataset):
                 # Decreasing the scale is equivalent to using a larger "span"
                 # in a sampling grid.
                 min_scale = int(
-                    round(
-                        float(min_scale)
-                        * crop_size
-                        / self.cfg.MULTIGRID.DEFAULT_S
-                    )
+                    round(float(min_scale) * crop_size / self.cfg.MULTIGRID.DEFAULT_S)
                 )
         elif self.mode in ["test"]:
             temporal_sample_index = (
-                self._spatial_temporal_idx[index]
-                // self.cfg.TEST.NUM_SPATIAL_CROPS
+                self._spatial_temporal_idx[index] // self.cfg.TEST.NUM_SPATIAL_CROPS
             )
             # spatial_sample_index is in [0, 1, 2]. Corresponding to left,
             # center, or right if width is larger than height, and top, middle,
             # or bottom if height is larger than width.
             spatial_sample_index = (
-                self._spatial_temporal_idx[index]
-                % self.cfg.TEST.NUM_SPATIAL_CROPS
+                self._spatial_temporal_idx[index] % self.cfg.TEST.NUM_SPATIAL_CROPS
             )
             min_scale, max_scale, crop_size = [self.cfg.DATA.TEST_CROP_SIZE] * 3
             # The testing is deterministic and no jitter should be performed.
             # min_scale, max_scale, and crop_size are expect to be the same.
             assert len({min_scale, max_scale, crop_size}) == 1
         else:
-            raise NotImplementedError(
-                "Does not support {} mode".format(self.mode)
+            raise NotImplementedError("Does not support {} mode".format(self.mode))
+
+        sampling_rate = utils.get_random_sampling_rate(
+            self.cfg.MULTIGRID.LONG_CYCLE_SAMPLING_RATE,
+            self.cfg.DATA.SAMPLING_RATE,
+        )
+
+        path_to_video = os.path.join(
+            self.cfg.DATA.PATH_PREFIX, self._path_to_videos[index][0] + ".webm"
+        )
+
+        # Try to decode and sample a clip from a video. If the video can not be
+        # decoded, repeatly find a random video replacement that can be decoded.
+        for i_try in range(self._num_retries):
+            video_container = None
+            try:
+                video_container = container.get_video_container(
+                    path_to_video,
+                    self.cfg.DATA_LOADER.ENABLE_MULTI_THREAD_DECODE,
+                    self.cfg.DATA.DECODING_BACKEND,
+                )
+            except Exception as e:
+                logger.info(
+                    "Failed to load video from {} with error {}".format(
+                        path_to_video, e
+                    )
+                )
+            # Select a random video if the current video was not able to access.
+            if video_container is None:
+                logger.warning(
+                    "Failed to load video idx {} from {}; trial {}".format(
+                        index, path_to_video, i_try
+                    )
+                )
+                if self.mode not in ["test"] and i_try > self._num_retries // 2:
+                    # let's try another one
+                    index = random.randint(0, len(self._path_to_videos) - 1)
+                elif self.mode in ["test"] and i_try > self._num_retries // 2:
+                    # BUG: should not repeat video
+                    logger.info(
+                        "Failed to load video idx {} from {}; use idx {}".format(
+                            index, path_to_video, index - 1
+                        )
+                    )
+                    index = index - 1
+                continue
+
+            # Decode video. Meta info is used to perform selective decoding.
+            frames = decoder.decode(
+                video_container,
+                sampling_rate,
+                self.cfg.DATA.NUM_FRAMES,
+                temporal_sample_index,
+                self.cfg.TEST.NUM_ENSEMBLE_VIEWS,
+                video_meta=self._video_meta[index],
+                target_fps=self.cfg.DATA.TARGET_FPS,
+                backend=self.cfg.DATA.DECODING_BACKEND,
+                max_spatial_scale=min_scale,
+                use_offset=self.cfg.DATA.USE_OFFSET_SAMPLING,
+                sparse=True,
             )
 
-        if self.mode in ["test"]:
-            seq = self.get_seq_frames(index, temporal_sample_index)
-        else:
-            seq = self.get_seq_frames(index, 0)
+            # If decoding failed (wrong format, video is too short, and etc),
+            # select another video.
+            if frames is None:
+                logger.warning(
+                    "Failed to decode video idx {} from {}; trial {}".format(
+                        index, path_to_video, i_try
+                    )
+                )
+                if self.mode not in ["test"] and i_try > self._num_retries // 2:
+                    # let's try another one
+                    index = random.randint(0, len(self._path_to_videos) - 1)
+                continue
 
-        path_template = os.path.join(
-                            self.cfg.DATA.PATH_PREFIX,
-                            self._path_to_videos[index][0],
-                            self.cfg.DATA.IMAGE_TEMPLATE
+            if self.aug:
+                if self.cfg.AUG.NUM_SAMPLE > 1:
+                    frame_list = []
+                    label_list = []
+                    index_list = []
+                    for _ in range(self.cfg.AUG.NUM_SAMPLE):
+                        new_frames = self._aug_frame(
+                            frames,
+                            spatial_sample_index,
+                            min_scale,
+                            max_scale,
+                            crop_size,
                         )
-        frames = torch.as_tensor(
-            utils.retry_load_images(
-                [path_template.format(frame) for frame in seq],
-                self._num_retries,
-        ))
+                        label = self._labels[index]
+                        new_frames = utils.pack_pathway_output(self.cfg, new_frames)
+                        frame_list.append(new_frames)
+                        label_list.append(label)
+                        index_list.append(index)
+                    return frame_list, label_list, index_list, {}
 
-        label = self._labels[index]
-
-        if self.aug:
-            if self.cfg.AUG.NUM_SAMPLE > 1:
-
-                frame_list = []
-                label_list = []
-                index_list = []
-                for _ in range(self.cfg.AUG.NUM_SAMPLE):
-                    new_frames = self._aug_frame(
+                else:
+                    frames = self._aug_frame(
                         frames,
                         spatial_sample_index,
                         min_scale,
                         max_scale,
                         crop_size,
                     )
-                    new_frames = utils.pack_pathway_output(
-                        self.cfg, new_frames
-                    )
-                    frame_list.append(new_frames)
-                    label_list.append(label)
-                    index_list.append(index)
-                return frame_list, label_list, index_list, {}
 
             else:
-                frames = self._aug_frame(
+                frames = utils.tensor_normalize(
+                    frames, self.cfg.DATA.MEAN, self.cfg.DATA.STD
+                )
+                # T H W C -> C T H W.
+                frames = frames.permute(3, 0, 1, 2)
+                # Perform data augmentation.
+                frames = utils.spatial_sampling(
                     frames,
-                    spatial_sample_index,
-                    min_scale,
-                    max_scale,
-                    crop_size,
+                    spatial_idx=spatial_sample_index,
+                    min_scale=min_scale,
+                    max_scale=max_scale,
+                    crop_size=crop_size,
+                    random_horizontal_flip=self.cfg.DATA.RANDOM_FLIP,
+                    inverse_uniform_sampling=self.cfg.DATA.INV_UNIFORM_SAMPLE,
                 )
 
+            label = self._labels[index]
+            frames = utils.pack_pathway_output(self.cfg, frames)
+            return frames, label, index, {}
         else:
-            frames = utils.tensor_normalize(
-                frames, self.cfg.DATA.MEAN, self.cfg.DATA.STD
+            raise RuntimeError(
+                "Failed to load video idx {} from {} after {} retries".format(
+                    index, path_to_video, self._num_retries
+                )
             )
-            # T H W C -> C T H W.
-            frames = frames.permute(3, 0, 1, 2)
-            # Perform data augmentation.
-            frames = utils.spatial_sampling(
-                frames,
-                spatial_idx=spatial_sample_index,
-                min_scale=min_scale,
-                max_scale=max_scale,
-                crop_size=crop_size,
-                random_horizontal_flip=self.cfg.DATA.RANDOM_FLIP,
-                inverse_uniform_sampling=self.cfg.DATA.INV_UNIFORM_SAMPLE,
-            )
-
-        frames = utils.pack_pathway_output(self.cfg, frames)
-        return frames, label, index, {}
 
     def _aug_frame(
         self,
@@ -309,9 +363,7 @@ class Sth(torch.utils.data.Dataset):
         frames = self._list_img_to_frames(list_img)
         frames = frames.permute(0, 2, 3, 1)
 
-        frames = utils.tensor_normalize(
-            frames, self.cfg.DATA.MEAN, self.cfg.DATA.STD
-        )
+        frames = utils.tensor_normalize(frames, self.cfg.DATA.MEAN, self.cfg.DATA.STD)
         # T H W C -> C T H W.
         frames = frames.permute(3, 0, 1, 2)
         # Perform data augmentation.
@@ -319,12 +371,8 @@ class Sth(torch.utils.data.Dataset):
             self.cfg.DATA.TRAIN_JITTER_SCALES_RELATIVE,
             self.cfg.DATA.TRAIN_JITTER_ASPECT_RELATIVE,
         )
-        relative_scales = (
-            None if (self.mode not in ["train"] or len(scl) == 0) else scl
-        )
-        relative_aspect = (
-            None if (self.mode not in ["train"] or len(asp) == 0) else asp
-        )
+        relative_scales = None if (self.mode not in ["train"] or len(scl) == 0) else scl
+        relative_aspect = None if (self.mode not in ["train"] or len(asp) == 0) else asp
         frames = utils.spatial_sampling(
             frames,
             spatial_idx=spatial_sample_index,
@@ -355,9 +403,7 @@ class Sth(torch.utils.data.Dataset):
         return frames
 
     def _frame_to_list_img(self, frames):
-        img_list = [
-            transforms.ToPILImage()(frames[i]) for i in range(frames.size(0))
-        ]
+        img_list = [transforms.ToPILImage()(frames[i]) for i in range(frames.size(0))]
         return img_list
 
     def _list_img_to_frames(self, img_list):
