@@ -1,7 +1,7 @@
 NUM_SHARDS=1
 NUM_GPUS=1
-BATCH_SIZE=16
-BASE_LR=4e-5
+BATCH_SIZE=6
+BASE_LR=2e-7
 PYTHONPATH=$PYTHONPATH:./slowfast \
 python tools/run_net_multi_node.py \
   --init_method tcp://localhost:10125 \
