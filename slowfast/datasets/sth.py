@@ -118,7 +118,7 @@ class Sth(torch.utils.data.Dataset):
             self._labels.append(label)
 
         self._video_meta = list(
-            chain.from_iterable([{} * self._num_clips for _ in self._path_to_videos])
+            chain.from_iterable([[{}] * self._num_clips for _ in self._path_to_videos])
         )
 
         # Extend self when self._num_clips > 1 (during testing).
