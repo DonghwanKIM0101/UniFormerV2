@@ -181,6 +181,7 @@ class Sth(torch.utils.data.Dataset):
         if self.mode in ["train", "val"]:
             # -1 indicates random sampling.
             spatial_sample_index = -1
+            temporal_sample_index = 0
             min_scale = self.cfg.DATA.TRAIN_JITTER_SCALES[0]
             max_scale = self.cfg.DATA.TRAIN_JITTER_SCALES[1]
             crop_size = self.cfg.DATA.TRAIN_CROP_SIZE
